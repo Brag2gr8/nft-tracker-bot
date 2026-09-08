@@ -110,15 +110,14 @@ async def send_alert_dm(user_id: str, nft_data: dict, event_type: str):
 # ---------------- Slash Commands ----------------
 
 @bot.tree.command(name="setwallet", description="Start tracking a wallet for NFT buy/sell activity")
-@app_commands.describe(chain="ethereum, solana, or robinhood", address="Wallet address to track")
-async def setwallet(interaction: discord.Interaction, chain: str, address: str):
-    if not is_valid_chain(chain):
-        await interaction.response.send_message(
-            f"Unsupported chain `{chain}`. Choose from: {', '.join(SUPPORTED_CHAINS)}",
-            ephemeral=True,
-        )
-        return
-
+@app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address to track")
+@app_commands.choices(chain=[
+    app_commands.Choice(name="Ethereum", value="ethereum"),
+    app_commands.Choice(name="Solana", value="solana"),
+    app_commands.Choice(name="Robinhood Chain", value="robinhood"),
+])
+async def setwallet(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
+    chain = chain.value
     added = db.add_wallet(str(interaction.user.id), chain, address)
     if added:
         await interaction.response.send_message(
@@ -133,8 +132,14 @@ async def setwallet(interaction: discord.Interaction, chain: str, address: str):
 
 
 @bot.tree.command(name="removewallet", description="Stop tracking a wallet")
-@app_commands.describe(chain="ethereum, solana, or robinhood", address="Wallet address to remove")
-async def removewallet(interaction: discord.Interaction, chain: str, address: str):
+@app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address to remove")
+@app_commands.choices(chain=[
+    app_commands.Choice(name="Ethereum", value="ethereum"),
+    app_commands.Choice(name="Solana", value="solana"),
+    app_commands.Choice(name="Robinhood Chain", value="robinhood"),
+])
+async def removewallet(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
+    chain = chain.value
     removed = db.remove_wallet(str(interaction.user.id), chain, address)
     if removed:
         await interaction.response.send_message(
@@ -158,8 +163,14 @@ async def mywallets(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="holdings", description="Show NFTs currently held in a tracked wallet (per our records)")
-@app_commands.describe(chain="ethereum, solana, or robinhood", address="Wallet address")
-async def holdings(interaction: discord.Interaction, chain: str, address: str):
+@app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address")
+@app_commands.choices(chain=[
+    app_commands.Choice(name="Ethereum", value="ethereum"),
+    app_commands.Choice(name="Solana", value="solana"),
+    app_commands.Choice(name="Robinhood Chain", value="robinhood"),
+])
+async def holdings(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
+    chain = chain.value
     wallets = db.get_wallets_for_user(str(interaction.user.id))
     match = next((w for w in wallets if w["chain"] == chain.lower() and w["address"] == address), None)
     if not match:
