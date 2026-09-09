@@ -120,6 +120,9 @@ async def _get_ethereum_sales(wallet: dict, subdomain: str) -> list[dict]:
                 role_param: address,
             }
             async with session.get(base_url, params=params) as resp:
+                if resp.status == 429:
+                    log.warning("Alchemy rate limit hit (429) on getNFTSales for %s — will retry next poll cycle", address)
+                    continue
                 if resp.status != 200:
                     body = await resp.text()
                     log.error("Alchemy error %s for %s (%s): %s", resp.status, address, role_param, body)
@@ -185,6 +188,7 @@ async def _get_ethereum_sales(wallet: dict, subdomain: str) -> list[dict]:
             "marketplace": sale.get("marketplace", "Unknown"),
             "chain": chain,
             "wallet": address,
+            "tx_hash": tx_hash,
             "listing_url": EXPLORER_TX_URL[chain].format(hash=tx_hash),
             "timestamp": datetime.now(timezone.utc),
         })
@@ -232,6 +236,9 @@ async def _get_evm_transfers(wallet: dict, subdomain: str) -> list[dict]:
         }
         async with aiohttp.ClientSession() as session:
             async with session.post(rpc_url, json=payload) as resp:
+                if resp.status == 429:
+                    log.warning("Alchemy rate limit hit (429) on getAssetTransfers for %s — will retry next poll cycle", address)
+                    return []
                 if resp.status != 200:
                     body = await resp.text()
                     log.error("Alchemy transfers error %s for %s: %s", resp.status, address, body)
@@ -284,6 +291,7 @@ async def _get_evm_transfers(wallet: dict, subdomain: str) -> list[dict]:
             "marketplace": "Robinhood Chain",
             "chain": chain,
             "wallet": address,
+            "tx_hash": tx_hash,
             "listing_url": EXPLORER_TX_URL[chain].format(hash=tx_hash),
             "timestamp": timestamp,
         })
@@ -387,6 +395,9 @@ async def _get_solana_events(wallet: dict) -> list[dict]:
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
+            if resp.status == 429:
+                log.warning("Helius rate limit hit (429) for %s — will retry next poll cycle", address)
+                return []
             if resp.status != 200:
                 body = await resp.text()
                 log.error("Helius error %s for %s: %s", resp.status, address, body)
@@ -446,6 +457,7 @@ async def _get_solana_events(wallet: dict) -> list[dict]:
             "marketplace": tx.get("source", "Unknown"),
             "chain": "solana",
             "wallet": address,
+            "tx_hash": tx.get("signature"),
             "listing_url": f"https://solscan.io/tx/{tx.get('signature')}",
             "timestamp": datetime.fromtimestamp(tx.get("timestamp", 0), tz=timezone.utc),
         })
@@ -636,3 +648,132 @@ async def _get_solana_holdings(wallet: dict) -> list[dict]:
             page += 1
 
     return holdings
+
+
+# ---------------------------------------------------------------------------
+# Floor price lookup — used by /floorprice
+# ---------------------------------------------------------------------------
+
+async def get_floor_price(chain: str, contract_address: str):
+    """
+    Returns (floor_price: float, currency: str, marketplace: str) or
+    (None, None, None) if unavailable.
+    """
+    if chain in ("ethereum", "robinhood"):
+        return await _get_evm_floor_price(chain, contract_address)
+    elif chain == "solana":
+        return await _get_solana_floor_price(contract_address)
+    return None, None, None
+
+
+async def _get_evm_floor_price(chain: str, contract_address: str):
+    """
+    Uses Alchemy's getFloorPrice endpoint. Note: like getNFTSales, marketplace
+    floor aggregation may have limited coverage on newer chains like Robinhood
+    Chain — treat a missing result as "not available yet" rather than an error.
+    """
+    if not ALCHEMY_API_KEY:
+        return None, None, None
+
+    subdomain = ALCHEMY_NETWORK_SLUG.get(chain)
+    if not subdomain:
+        return None, None, None
+
+    url = f"https://{subdomain}.g.alchemy.com/nft/v3/{ALCHEMY_API_KEY}/getFloorPrice"
+    params = {"contractAddress": contract_address}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 429:
+                    log.warning("Alchemy rate limit hit on getFloorPrice for %s", contract_address)
+                    return None, None, None
+                if resp.status != 200:
+                    return None, None, None
+                data = await resp.json()
+    except Exception:
+        log.exception("Failed to fetch floor price for %s", contract_address)
+        return None, None, None
+
+    # Response has one sub-object per marketplace (e.g. openSea, looksRare) —
+    # pick the first one that didn't error out.
+    for marketplace, info in data.items():
+        if isinstance(info, dict) and "error" not in info and info.get("floorPrice") is not None:
+            return info["floorPrice"], info.get("priceCurrency", "ETH"), marketplace
+
+    return None, None, None
+
+
+async def _get_solana_floor_price(mint_or_collection: str):
+    """
+    Uses Magic Eden's public API (no key required) to look up a collection's
+    floor price. Expects a collection symbol, not a mint address — see the
+    /floorprice command's help text for how the user should supply this.
+    """
+    url = f"https://api-mainnet.magiceden.dev/v2/collections/{mint_or_collection}/stats"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None, None, None
+                data = await resp.json()
+    except Exception:
+        log.exception("Failed to fetch Magic Eden floor price for %s", mint_or_collection)
+        return None, None, None
+
+    floor_lamports = data.get("floorPrice")
+    if floor_lamports is None:
+        return None, None, None
+
+    return floor_lamports / 1_000_000_000, "SOL", "Magic Eden"
+
+
+# ---------------------------------------------------------------------------
+# Gas cost lookup — best-effort enrichment for EVM buy/sell alerts
+# ---------------------------------------------------------------------------
+
+async def get_gas_cost(chain: str, tx_hash: str):
+    """
+    Returns gas cost in ETH (float) for a given transaction, or None if
+    unavailable. Uses the standard eth_getTransactionReceipt RPC method,
+    which is part of Alchemy's core node access (distinct from their
+    higher-level "Transaction Receipts" data API, which has narrower
+    per-chain coverage) — so this works on Ethereum and should also work
+    on Robinhood Chain as a basic RPC call.
+    """
+    if not ALCHEMY_API_KEY:
+        return None
+
+    subdomain = ALCHEMY_NETWORK_SLUG.get(chain)
+    if not subdomain:
+        return None
+
+    rpc_url = f"https://{subdomain}.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getTransactionReceipt",
+        "params": [tx_hash],
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(rpc_url, json=payload) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception:
+        log.exception("Failed to fetch gas receipt for %s", tx_hash)
+        return None
+
+    result = data.get("result")
+    if not result:
+        return None
+
+    try:
+        gas_used = int(result["gasUsed"], 16)
+        effective_gas_price = int(result["effectiveGasPrice"], 16)
+        return (gas_used * effective_gas_price) / 1e18
+    except (KeyError, ValueError, TypeError):
+        return None
