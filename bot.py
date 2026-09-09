@@ -408,44 +408,48 @@ async def poll_wallets():
             continue
 
         for event in events:
-            # Best-effort gas cost enrichment for EVM chains only
-            if wallet["chain"] in ("ethereum", "robinhood") and event.get("tx_hash"):
-                try:
-                    event["gas_cost"] = await chain_clients.get_gas_cost(wallet["chain"], event["tx_hash"])
-                except Exception:
-                    log.exception(f"Failed to fetch gas cost for tx {event.get('tx_hash')}")
+            try:
+                # Best-effort gas cost enrichment for EVM chains only
+                if wallet["chain"] in ("ethereum", "robinhood") and event.get("tx_hash"):
+                    try:
+                        event["gas_cost"] = await chain_clients.get_gas_cost(wallet["chain"], event["tx_hash"])
+                    except Exception:
+                        log.exception(f"Failed to fetch gas cost for tx {event.get('tx_hash')}")
 
-            pnl = None
-            if event["event_type"] == "buy":
-                db.add_holding(
+                pnl = None
+                if event["event_type"] == "buy":
+                    db.add_holding(
+                        wallet_id=wallet["id"],
+                        contract_address=event["contract_address"],
+                        token_id=event["token_id"],
+                        collection_name=event.get("collection_name"),
+                        token_name=event.get("token_name"),
+                        purchase_price=event.get("price"),
+                        purchase_currency=event.get("currency"),
+                    )
+                    await send_alert_dm(wallet["user_id"], event, "buy")
+
+                elif event["event_type"] == "sell":
+                    held = db.pop_holding(wallet["id"], event["contract_address"], event["token_id"])
+                    if held and isinstance(event.get("price"), (int, float)) and held.get("purchase_price") is not None:
+                        event["purchase_price"] = held["purchase_price"]
+                        pnl = event["price"] - held["purchase_price"]
+                    await send_alert_dm(wallet["user_id"], event, "sell")
+
+                db.log_event(
                     wallet_id=wallet["id"],
-                    contract_address=event["contract_address"],
-                    token_id=event["token_id"],
+                    user_id=wallet["user_id"],
+                    event_type=event["event_type"],
+                    chain=wallet["chain"],
                     collection_name=event.get("collection_name"),
                     token_name=event.get("token_name"),
-                    purchase_price=event.get("price"),
-                    purchase_currency=event.get("currency"),
+                    price=event.get("price"),
+                    currency=event.get("currency"),
+                    pnl=pnl,
                 )
-                await send_alert_dm(wallet["user_id"], event, "buy")
-
-            elif event["event_type"] == "sell":
-                held = db.pop_holding(wallet["id"], event["contract_address"], event["token_id"])
-                if held and isinstance(event.get("price"), (int, float)) and held.get("purchase_price") is not None:
-                    event["purchase_price"] = held["purchase_price"]
-                    pnl = event["price"] - held["purchase_price"]
-                await send_alert_dm(wallet["user_id"], event, "sell")
-
-            db.log_event(
-                wallet_id=wallet["id"],
-                user_id=wallet["user_id"],
-                event_type=event["event_type"],
-                chain=wallet["chain"],
-                collection_name=event.get("collection_name"),
-                token_name=event.get("token_name"),
-                price=event.get("price"),
-                currency=event.get("currency"),
-                pnl=pnl,
-            )
+            except Exception:
+                log.exception(f"Failed to process event for wallet {wallet['address']}: {event}")
+                continue
 
 
 @poll_wallets.before_loop
