@@ -20,6 +20,7 @@ Blockchain-specific logic lives in chain_clients.py
 """
 
 import os
+import re
 import asyncio
 import logging
 from datetime import datetime, timezone, timedelta
@@ -126,8 +127,13 @@ def build_alert_embed(nft_data: dict, event_type: str) -> discord.Embed:
     if nft_data.get("gas_cost") is not None:
         embed.add_field(name="Gas Fee", value=f"{nft_data['gas_cost']:.5f} ETH", inline=True)
 
+    links = []
     if nft_data.get("listing_url"):
-        embed.add_field(name="Link", value=f"[View]({nft_data['listing_url']})", inline=False)
+        links.append(f"[Explorer]({nft_data['listing_url']})")
+    if nft_data.get("opensea_url"):
+        links.append(f"[OpenSea]({nft_data['opensea_url']})")
+    if links:
+        embed.add_field(name="Links", value=" • ".join(links), inline=False)
 
     return embed
 
@@ -183,11 +189,32 @@ async def send_digest_dm(user_id: str, events: list[dict], period_label: str):
 
 # ---------------- Slash Commands ----------------
 
+EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # base58, roughly
+
+
+def is_valid_address(chain: str, address: str) -> bool:
+    if chain in ("ethereum", "robinhood"):
+        return bool(EVM_ADDRESS_RE.match(address))
+    elif chain == "solana":
+        return bool(SOLANA_ADDRESS_RE.match(address)) and "..." not in address
+    return True
+
+
 @bot.tree.command(name="setwallet", description="Start tracking a wallet for NFT buy/sell activity")
 @app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address to track")
 @app_commands.choices(chain=CHAIN_CHOICES)
 async def setwallet(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
     chain = chain.value
+
+    if not is_valid_address(chain, address):
+        await interaction.response.send_message(
+            "That doesn't look like a valid, full wallet address. "
+            "Make sure you're pasting the complete address, not a shortened "
+            "version like `0x1234...abcd`.",
+            ephemeral=True,
+        )
+        return
 
     current_count = db.count_wallets_for_user(str(interaction.user.id))
     if current_count >= MAX_WALLETS_PER_USER:
