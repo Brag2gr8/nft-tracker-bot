@@ -80,7 +80,7 @@ def build_alert_embed(nft_data: dict, event_type: str) -> discord.Embed:
     embed.add_field(name="Chain", value=nft_data.get("chain", "Unknown").capitalize(), inline=True)
     embed.add_field(name="Wallet", value=f"`{format_wallet(nft_data.get('wallet', ''))}`", inline=True)
 
-    if event_type == "sell" and nft_data.get("purchase_price") is not None:
+    if event_type == "sell" and nft_data.get("purchase_price") is not None and isinstance(nft_data.get("price"), (int, float)):
         pnl = nft_data["price"] - nft_data["purchase_price"]
         sign = "+" if pnl >= 0 else ""
         embed.add_field(
@@ -177,17 +177,38 @@ async def holdings(interaction: discord.Interaction, chain: app_commands.Choice[
         await interaction.response.send_message("That wallet isn't in your tracked list.", ephemeral=True)
         return
 
-    held = db.get_holdings_for_wallet(match["id"])
-    if not held:
-        await interaction.response.send_message("No holdings recorded yet for this wallet.", ephemeral=True)
+    # Live lookups can take a couple seconds (pagination on larger wallets),
+    # so defer to avoid Discord's 3-second interaction timeout.
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        live_holdings = await chain_clients.get_current_holdings(match)
+    except Exception:
+        log.exception(f"Failed to fetch live holdings for wallet {match['id']}")
+        await interaction.followup.send("Couldn't fetch holdings right now — try again in a bit.", ephemeral=True)
         return
 
-    lines = [
-        f"• {h['token_name'] or h['token_id']} ({h['collection_name'] or 'Unknown'}) — "
-        f"bought at {h['purchase_price']} {h['purchase_currency'] or ''}"
-        for h in held
-    ]
-    await interaction.response.send_message("Current holdings:\n" + "\n".join(lines), ephemeral=True)
+    if not live_holdings:
+        await interaction.followup.send("This wallet doesn't currently hold any NFTs (per on-chain data).", ephemeral=True)
+        return
+
+    # Cross-reference against our own purchase-price records where we have them
+    recorded = {
+        (h["contract_address"], str(h["token_id"])): h
+        for h in db.get_holdings_for_wallet(match["id"])
+    }
+
+    lines = []
+    for nft in live_holdings[:30]:  # cap to keep the message under Discord's limit
+        key = (nft["contract_address"], str(nft["token_id"]))
+        record = recorded.get(key)
+        price_note = f" — bought at {record['purchase_price']} {record['purchase_currency'] or ''}" if record else ""
+        lines.append(f"• {nft['token_name']} ({nft['collection_name']}){price_note}")
+
+    header = f"Current holdings ({len(live_holdings)} total"
+    header += ", showing first 30)" if len(live_holdings) > 30 else ")"
+
+    await interaction.followup.send(header + ":\n" + "\n".join(lines), ephemeral=True)
 
 
 @bot.tree.command(name="status", description="Check bot health")
