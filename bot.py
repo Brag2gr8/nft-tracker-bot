@@ -239,7 +239,7 @@ async def setwallet(interaction: discord.Interaction, chain: app_commands.Choice
 
 
 @bot.tree.command(name="removewallet", description="Stop tracking a wallet")
-@app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address to remove")
+@app_commands.describe(chain="Which blockchain this wallet is on", address="Select the wallet to remove")
 @app_commands.choices(chain=CHAIN_CHOICES)
 async def removewallet(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
     chain = chain.value
@@ -252,6 +252,33 @@ async def removewallet(interaction: discord.Interaction, chain: app_commands.Cho
         await interaction.response.send_message(
             "Couldn't find that wallet in your tracked list.", ephemeral=True
         )
+
+
+@removewallet.autocomplete("address")
+async def removewallet_address_autocomplete(interaction: discord.Interaction, current: str):
+    """Populates the address field with the user's own tracked wallets,
+    filtered to whichever chain they've already picked (if any), and
+    matched against whatever they've typed so far."""
+    wallets = db.get_wallets_for_user(str(interaction.user.id))
+
+    selected_chain = None
+    try:
+        selected_chain = interaction.namespace.chain
+    except AttributeError:
+        pass
+    if isinstance(selected_chain, app_commands.Choice):
+        selected_chain = selected_chain.value
+
+    if selected_chain:
+        wallets = [w for w in wallets if w["chain"] == selected_chain]
+
+    current_lower = current.lower()
+    matches = [w for w in wallets if current_lower in w["address"].lower()]
+
+    return [
+        app_commands.Choice(name=f"{w['chain']} — {format_wallet(w['address'])}", value=w["address"])
+        for w in matches[:25]  # Discord caps autocomplete results at 25
+    ]
 
 
 @bot.tree.command(name="mywallets", description="List your tracked wallets")
@@ -269,7 +296,7 @@ async def mywallets(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="holdings", description="Show NFTs currently held in a tracked wallet (live, on-chain)")
-@app_commands.describe(chain="Which blockchain this wallet is on", address="Wallet address")
+@app_commands.describe(chain="Which blockchain this wallet is on", address="Select a tracked wallet")
 @app_commands.choices(chain=CHAIN_CHOICES)
 async def holdings(interaction: discord.Interaction, chain: app_commands.Choice[str], address: str):
     chain = chain.value
@@ -311,6 +338,32 @@ async def holdings(interaction: discord.Interaction, chain: app_commands.Choice[
     header += ", showing first 30)" if len(live_holdings) > 30 else ")"
 
     await interaction.followup.send(header + ":\n" + "\n".join(lines), ephemeral=True)
+
+
+@holdings.autocomplete("address")
+async def holdings_address_autocomplete(interaction: discord.Interaction, current: str):
+    """Same autocomplete pattern as /removewallet — shows the user's own
+    tracked wallets instead of requiring exact manual retyping."""
+    wallets = db.get_wallets_for_user(str(interaction.user.id))
+
+    selected_chain = None
+    try:
+        selected_chain = interaction.namespace.chain
+    except AttributeError:
+        pass
+    if isinstance(selected_chain, app_commands.Choice):
+        selected_chain = selected_chain.value
+
+    if selected_chain:
+        wallets = [w for w in wallets if w["chain"] == selected_chain]
+
+    current_lower = current.lower()
+    matches = [w for w in wallets if current_lower in w["address"].lower()]
+
+    return [
+        app_commands.Choice(name=f"{w['chain']} — {format_wallet(w['address'])}", value=w["address"])
+        for w in matches[:25]
+    ]
 
 
 @bot.tree.command(name="floorprice", description="Check a collection's current floor price")
@@ -414,7 +467,7 @@ async def help_command(interaction: discord.Interaction):
         "`/holdings <chain> <address>` — live NFT holdings for a tracked wallet",
         "`/floorprice <chain> <identifier>` — check a collection's floor price",
         "`/portfolio` — NFT count summary across all your tracked wallets",
-        "`/summary` — buy/sell digest for the last 7 days (also sent automatically every week)",
+        "`/summary` — buy/sell digest for the last 7 days",
         "`/status` — bot health check",
         "`/testalert` — send yourself a sample alert to confirm DMs work",
         f"\nWallet limit: {MAX_WALLETS_PER_USER} per user.",
@@ -484,30 +537,12 @@ async def before_poll():
     await bot.wait_until_ready()
 
 
-@tasks.loop(hours=168)  # weekly
-async def weekly_digest():
-    since = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    for user_id in db.get_all_user_ids_with_wallets():
-        events = db.get_events_since(user_id, since)
-        await send_digest_dm(user_id, events, "Weekly")
-
-
-@weekly_digest.before_loop
-async def before_digest():
-    await bot.wait_until_ready()
-    # Wait a bit after startup before the first weekly cycle begins, so a
-    # bot restart doesn't immediately re-fire a digest.
-    await asyncio.sleep(60)
-
-
 @bot.event
 async def on_ready():
     db.init_db()
     await bot.tree.sync()
     if not poll_wallets.is_running():
         poll_wallets.start()
-    if not weekly_digest.is_running():
-        weekly_digest.start()
     log.info(f"Logged in as {bot.user}. Slash commands synced. Polling every {POLL_INTERVAL_SECONDS}s.")
 
 
