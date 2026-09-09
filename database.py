@@ -56,6 +56,21 @@ def init_db():
                 last_checked_at TEXT,
                 FOREIGN KEY (wallet_id) REFERENCES wallets(id)
             );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,      -- 'buy' or 'sell'
+                chain TEXT NOT NULL,
+                collection_name TEXT,
+                token_name TEXT,
+                price REAL,
+                currency TEXT,
+                pnl REAL,                      -- only set on sells where we knew the purchase price
+                occurred_at TEXT NOT NULL,
+                FOREIGN KEY (wallet_id) REFERENCES wallets(id)
+            );
             """
         )
 
@@ -179,3 +194,51 @@ def set_last_signature(wallet_id: int, signature: str):
                  last_checked_at=excluded.last_checked_at""",
             (wallet_id, signature, _now()),
         )
+
+
+# ---------- Wallet limits ----------
+
+def count_wallets_for_user(user_id: str) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) as cnt FROM wallets WHERE user_id = ?", (str(user_id),)
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+
+# ---------- Event log (for /summary digests) ----------
+
+def log_event(wallet_id: int, user_id: str, event_type: str, chain: str,
+              collection_name: str, token_name: str, price, currency: str, pnl=None):
+    """
+    price/pnl may be non-numeric (e.g. the string "Unknown" for a Robinhood
+    Chain trade where we couldn't resolve payment) — store NULL in that case
+    rather than failing, since this log is for human-readable summaries only.
+    """
+    price_val = price if isinstance(price, (int, float)) else None
+    pnl_val = pnl if isinstance(pnl, (int, float)) else None
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO events
+               (wallet_id, user_id, event_type, chain, collection_name, token_name,
+                price, currency, pnl, occurred_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (wallet_id, str(user_id), event_type, chain, collection_name, token_name,
+             price_val, currency, pnl_val, _now()),
+        )
+
+
+def get_events_since(user_id: str, since_iso: str):
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events WHERE user_id = ? AND occurred_at >= ? ORDER BY occurred_at",
+            (str(user_id), since_iso),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_all_user_ids_with_wallets():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT user_id FROM wallets").fetchall()
+        return [r["user_id"] for r in rows]
