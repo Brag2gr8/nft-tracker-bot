@@ -5,14 +5,45 @@ when something happens.
 
 ## Current status
 
-✅ Discord bot skeleton — slash commands, DM alerts, SQLite storage
-⬜ Ethereum / Robinhood Chain tracking (via Alchemy) — not yet implemented
-⬜ Solana tracking (via Helius) — not yet implemented
+✅ Discord bot — slash commands, DM alerts, SQLite storage with persistent volume support
+✅ Ethereum tracking (via Alchemy `getNFTSales`)
+✅ Robinhood Chain tracking (via Alchemy Transfers API — `getNFTSales` isn't available on this chain yet, so this uses raw transfer detection + best-effort price matching instead)
+✅ Solana tracking (via Helius Enhanced Transactions API)
+✅ Live on-chain holdings lookup (`/holdings`)
+✅ Floor price lookup (`/floorprice`)
+✅ Portfolio summary across wallets (`/portfolio`)
+✅ Weekly + on-demand buy/sell digest (`/summary`, auto weekly DM)
+✅ Gas cost shown on EVM buy/sell alerts (best-effort)
+✅ Wallet-count rate limit per user (default 10, via `MAX_WALLETS_PER_USER`)
+✅ Basic HTTP healthcheck endpoint for uptime monitoring (`/ping`) — see note below
+✅ `/help` command
 
-Right now, `/setwallet` will save wallets and the bot will poll on a loop,
-but `chain_clients.py` returns no events yet since the blockchain API calls
-haven't been wired in. `/testalert` works right now and lets you confirm
-DMs are reaching you correctly.
+### Known limitations
+- **Robinhood Chain price detection is best-effort.** Alchemy doesn't have
+  dedicated marketplace-sale parsing for this chain yet (it's brand new),
+  so we detect the NFT transfer reliably but the price may show "Unknown"
+  if the trade routed through an escrow/marketplace contract we can't trace
+  with a simple paired-payment lookup.
+- **The healthcheck server may not be reachable externally on Railway**
+  unless the service has a public domain generated and/or the Procfile
+  process type is `web` rather than `worker`. Check Railway's networking
+  settings if an external uptime monitor (e.g. UptimeRobot) can't reach it —
+  the server itself is running either way, just may only be reachable
+  internally.
+- `/portfolio` shows NFT counts per wallet but does not yet total floor
+  value across collections — use `/floorprice` per collection for now.
+
+### Getting an Alchemy API key (free tier)
+1. Go to https://dashboard.alchemy.com/signup and sign up
+2. Create an app — for Ethereum, pick network "Ethereum Mainnet"; for
+   Robinhood Chain, pick "Robinhood Chain Mainnet" (same API key generally
+   works across networks, actual per-network access may depend on your plan)
+3. Paste it into `.env` as `ALCHEMY_API_KEY=your_key_here`
+
+### Getting a Helius API key (free tier)
+1. Go to https://dashboard.helius.dev and sign up
+2. Create an API key — free tier includes 1M credits/month, no card required
+3. Paste it into `.env` as `HELIUS_API_KEY=your_key_here`
 
 ## Setup
 
@@ -48,24 +79,39 @@ DMs are reaching you correctly.
 | `/setwallet <chain> <address>` | Start tracking a wallet (chain: ethereum, solana, robinhood) |
 | `/removewallet <chain> <address>` | Stop tracking a wallet |
 | `/mywallets` | List your tracked wallets |
-| `/holdings <chain> <address>` | Show NFTs currently held per our records |
+| `/holdings <chain> <address>` | Show NFTs currently held, live from the chain |
+| `/floorprice <chain> <identifier>` | Check a collection's current floor price (contract address for EVM, Magic Eden symbol for Solana) |
+| `/portfolio` | NFT count summary across all your tracked wallets |
+| `/summary` | Buy/sell digest for the last 7 days (also sent automatically every week) |
 | `/status` | Bot health check |
 | `/testalert` | Send yourself a sample DM alert |
+| `/help` | List all commands |
+
+## Environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `DISCORD_TOKEN` | Yes | Your bot's token from the Discord Developer Portal |
+| `POLL_INTERVAL_SECONDS` | No (default 180) | How often to check tracked wallets |
+| `ALCHEMY_API_KEY` | For Ethereum/Robinhood Chain | From dashboard.alchemy.com |
+| `HELIUS_API_KEY` | For Solana | From dashboard.helius.dev |
+| `DB_PATH` | On Railway | Should point at your mounted volume, e.g. `/data/tracker.db`, so data survives redeploys |
+| `MAX_WALLETS_PER_USER` | No (default 10) | Per-user wallet tracking limit |
+| `PORT` | No (default 8080) | Port for the healthcheck HTTP server; Railway sets this automatically for web-exposed services |
 
 ## Project structure
 
 ```
-bot.py             - Discord bot, commands, alert formatting, polling loop
-database.py        - SQLite storage (wallets, holdings, last-seen tx markers)
-chain_clients.py   - Blockchain API integration (STUB - not yet implemented)
+bot.py             - Discord bot, commands, alert formatting, polling loop, digests, healthcheck server
+database.py        - SQLite storage (wallets, holdings, event log, last-seen tx markers)
+chain_clients.py   - Blockchain API integration (Alchemy for EVM chains, Helius for Solana)
 requirements.txt   - Python dependencies
 .env.example       - Environment variable template
-tracker.db         - SQLite database file (created automatically on first run)
+tracker.db         - SQLite database file (created automatically; use DB_PATH to point elsewhere)
 ```
 
 ## Next steps
 
-- Implement `_get_evm_events()` in `chain_clients.py` using the Alchemy NFT API
-  (covers both Ethereum and Robinhood Chain)
-- Implement `_get_solana_events()` using the Helius API
-- Test with real wallet addresses
+- Add floor-value totals to `/portfolio` (sum of floor prices across held collections)
+- Improve Robinhood Chain price detection once Alchemy adds marketplace-sale parsing for it
+- Consider webhooks instead of polling once wallet count grows beyond a handful
