@@ -51,6 +51,27 @@ EXPLORER_TX_URL = {
     "robinhood": "https://explorer.chain.robinhood.com/tx/{hash}",
 }
 
+# NOTE: OpenSea's exact URL slug for Robinhood Chain (a very new chain,
+# launched July 2026) isn't fully confirmed — "robinhood" follows their
+# usual naming convention (e.g. "ethereum", "solana"), but if this link
+# 404s once you test it, check an actual OpenSea Robinhood Chain
+# collection page URL and update this slug to match.
+OPENSEA_CHAIN_SLUG = {
+    "ethereum": "ethereum",
+    "robinhood": "robinhood",
+}
+
+
+def _opensea_asset_url(chain: str, contract_address: str, token_id) -> str:
+    slug = OPENSEA_CHAIN_SLUG.get(chain)
+    if not slug or not contract_address:
+        return None
+    return f"https://opensea.io/assets/{slug}/{contract_address}/{token_id}"
+
+
+def _opensea_solana_url(mint: str) -> str:
+    return f"https://opensea.io/assets/solana/{mint}" if mint else None
+
 
 async def get_new_nft_events(wallet: dict) -> list[dict]:
     """
@@ -101,6 +122,25 @@ async def _get_evm_events(wallet: dict) -> list[dict]:
         return await _get_evm_transfers(wallet, subdomain)
 
 
+async def _get_current_block_number(subdomain: str) -> int:
+    """Fetches the latest block number via basic eth_blockNumber RPC — used
+    to set a 'start tracking from now' baseline for newly added wallets,
+    instead of scanning all the way back to block 0 (which would surface
+    every historical transaction as if it were new)."""
+    rpc_url = f"https://{subdomain}.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(rpc_url, json=payload) as resp:
+                if resp.status != 200:
+                    return 0
+                data = await resp.json()
+                return int(data.get("result", "0x0"), 16)
+    except Exception:
+        log.exception("Failed to fetch current block number")
+        return 0
+
+
 async def _get_ethereum_sales(wallet: dict, subdomain: str) -> list[dict]:
     """Ethereum path: Alchemy's getNFTSales endpoint (clean parsed sale data)."""
     address = wallet["address"]
@@ -108,7 +148,17 @@ async def _get_ethereum_sales(wallet: dict, subdomain: str) -> list[dict]:
     base_url = f"https://{subdomain}.g.alchemy.com/nft/v3/{ALCHEMY_API_KEY}/getNFTSales"
 
     last_block_str = db.get_last_signature(wallet["id"])
-    from_block = hex(int(last_block_str) + 1) if last_block_str else "0x0"
+
+    if not last_block_str:
+        # First poll for this wallet — establish a baseline at the current
+        # block instead of scanning full history, so we only alert on
+        # activity going forward from now.
+        current_block = await _get_current_block_number(subdomain)
+        if current_block:
+            db.set_last_signature(wallet["id"], str(current_block))
+        return []
+
+    from_block = hex(int(last_block_str) + 1)
 
     all_sales = []
     async with aiohttp.ClientSession() as session:
@@ -190,6 +240,7 @@ async def _get_ethereum_sales(wallet: dict, subdomain: str) -> list[dict]:
             "wallet": address,
             "tx_hash": tx_hash,
             "listing_url": EXPLORER_TX_URL[chain].format(hash=tx_hash),
+            "opensea_url": _opensea_asset_url(chain, contract_address, token_id),
             "timestamp": datetime.now(timezone.utc),
         })
 
@@ -217,7 +268,17 @@ async def _get_evm_transfers(wallet: dict, subdomain: str) -> list[dict]:
     rpc_url = f"https://{subdomain}.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 
     last_block_str = db.get_last_signature(wallet["id"])
-    from_block = hex(int(last_block_str) + 1) if last_block_str else "0x0"
+
+    if not last_block_str:
+        # First poll for this wallet — establish a baseline at the current
+        # block instead of scanning full history, so we only alert on
+        # activity going forward from now.
+        current_block = await _get_current_block_number(subdomain)
+        if current_block:
+            db.set_last_signature(wallet["id"], str(current_block))
+        return []
+
+    from_block = hex(int(last_block_str) + 1)
 
     async def fetch_transfers(direction_key: str) -> list[dict]:
         payload = {
@@ -297,6 +358,7 @@ async def _get_evm_transfers(wallet: dict, subdomain: str) -> list[dict]:
             "wallet": address,
             "tx_hash": tx_hash,
             "listing_url": EXPLORER_TX_URL[chain].format(hash=tx_hash),
+            "opensea_url": _opensea_asset_url(chain, contract_address, token_id),
             "timestamp": timestamp,
         })
 
@@ -404,11 +466,21 @@ async def _get_solana_events(wallet: dict) -> list[dict]:
     address = wallet["address"]
     last_signature = db.get_last_signature(wallet["id"])
 
+    if not last_signature:
+        # First poll for this wallet — fetch the most recent signature only,
+        # to establish a "start tracking from now" baseline rather than
+        # alerting on this wallet's older NFT activity.
+        params = {"api-key": HELIUS_API_KEY, "limit": 1}
+        async with aiohttp.ClientSession() as session:
+            async with session.get(HELIUS_TX_HISTORY_URL.format(address=address), params=params) as resp:
+                if resp.status == 200:
+                    txs = await resp.json()
+                    if txs:
+                        db.set_last_signature(wallet["id"], txs[0].get("signature"))
+        return []
+
     url = HELIUS_TX_HISTORY_URL.format(address=address)
-    params = {"api-key": HELIUS_API_KEY, "limit": 100}
-    if last_signature:
-        # 'until' returns only transactions newer than this signature
-        params["until"] = last_signature
+    params = {"api-key": HELIUS_API_KEY, "limit": 100, "until": last_signature}
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
@@ -476,6 +548,7 @@ async def _get_solana_events(wallet: dict) -> list[dict]:
             "wallet": address,
             "tx_hash": tx.get("signature"),
             "listing_url": f"https://solscan.io/tx/{tx.get('signature')}",
+            "opensea_url": _opensea_solana_url(mint),
             "timestamp": datetime.fromtimestamp(tx.get("timestamp", 0), tz=timezone.utc),
         })
 
