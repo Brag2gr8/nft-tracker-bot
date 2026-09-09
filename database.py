@@ -11,15 +11,19 @@ Tables:
 """
 
 import sqlite3
+import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "tracker.db"
+# Uses DB_PATH env var if set (e.g. pointing at a Railway persistent volume
+# mount like /data/tracker.db). Falls back to a local file for dev.
+DB_PATH = Path(os.getenv("DB_PATH", Path(__file__).parent / "tracker.db"))
 
 
 def init_db():
     """Create tables if they don't already exist. Safe to call every startup."""
+    print(f"[database] Using DB_PATH = {DB_PATH}", flush=True)
     with get_conn() as conn:
         conn.executescript(
             """
