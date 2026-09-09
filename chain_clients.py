@@ -244,7 +244,11 @@ async def _get_evm_transfers(wallet: dict, subdomain: str) -> list[dict]:
                     log.error("Alchemy transfers error %s for %s: %s", resp.status, address, body)
                     return []
                 data = await resp.json()
-                return data.get("result", {}).get("transfers", [])
+                if data.get("error"):
+                    log.error("alchemy_getAssetTransfers error for %s: %s", address, data["error"].get("message"))
+                    return []
+                result = data.get("result") or {}
+                return result.get("transfers", [])
 
     incoming = await fetch_transfers("toAddress")   # candidate buys
     outgoing = await fetch_transfers("fromAddress")  # candidate sells
@@ -308,6 +312,13 @@ async def _find_paired_payment(rpc_url: str, tx_hash: str, wallet_address: str, 
     the NFT transfer, to infer the price paid. Returns (amount, "ETH") or
     (None, "ETH") if no matching payment is found (e.g. trade routed
     through an escrow/marketplace contract we can't trace here).
+
+    Note: the "internal" transfer category is not supported on every
+    network (confirmed unsupported on Robinhood Chain, which returns a
+    JSON-RPC error rather than empty data) — we request "external" only to
+    stay compatible everywhere. This means payments routed through internal
+    contract calls won't be detected here, which is an accepted limitation
+    given this chain's current API coverage.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -316,7 +327,7 @@ async def _find_paired_payment(rpc_url: str, tx_hash: str, wallet_address: str, 
         "params": [{
             "fromBlock": "0x0",
             "toBlock": "latest",
-            "category": ["external", "internal"],
+            "category": ["external"],
             "maxCount": "0x64",
             **({"fromAddress": wallet_address} if event_type == "buy" else {"toAddress": wallet_address}),
         }],
@@ -328,9 +339,15 @@ async def _find_paired_payment(rpc_url: str, tx_hash: str, wallet_address: str, 
                     return None, "ETH"
                 data = await resp.json()
     except Exception:
+        log.exception("Failed to fetch paired payment for tx %s", tx_hash)
         return None, "ETH"
 
-    for t in data.get("result", {}).get("transfers", []):
+    if data.get("error"):
+        log.warning("alchemy_getAssetTransfers error for tx %s: %s", tx_hash, data["error"].get("message"))
+        return None, "ETH"
+
+    result = data.get("result") or {}
+    for t in result.get("transfers", []):
         if t.get("hash") == tx_hash and t.get("value"):
             return t["value"], "ETH"
 
